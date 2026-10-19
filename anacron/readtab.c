@@ -212,7 +212,7 @@ register_period_job(const char *periods, const char *delays,
 		    const char *ident, char *command)
 /* Store a job definition with a named period */
 {
-    int delay;
+    int delay, named_period;
     job_rec *jr;
     int ident_len, command_len;
 
@@ -227,22 +227,27 @@ register_period_job(const char *periods, const char *delays,
 	return;
     }
 
+    if (!strcmp("@monthly", periods)) {
+		named_period = 1;
+    } else if (!strcmp("@yearly", periods) ||
+               !strcmp("@annually", periods) ||
+               !strcmp(/* backwards compat misspelling */"@annualy", periods)) {
+		named_period = 2;
+	} else if (!strcmp("@daily", periods)) {
+		named_period = 3;
+	} else if (!strcmp("@weekly", periods)) {
+		named_period = 4;
+    } else {
+		complain("%s: Unknown named period on line %d, skipping",
+			 anacrontab, line_num);
+		return;
+    }
+
     jr = obstack_alloc(&tab_o, sizeof(job_rec));
     if (jr == NULL) {
         die_e("Cannot allocate memory.");
     }
-    if (!strncmp ("@monthly", periods, 8)) {
-		jr->named_period = 1;
-    } else if (!strncmp("@yearly", periods, 7) || !strncmp("@annually", periods, 9) || !strncmp(/* backwards compat misspelling */"@annualy", periods, 8)) {
-		jr->named_period = 2;
-	} else if (!strncmp ("@daily", periods, 6)) {
-		jr->named_period = 3;
-	} else if (!strncmp ("@weekly", periods, 7)) {
-		jr->named_period = 4;
-    } else {
-		complain("%s: Unknown named period on line %d, skipping",
-			 anacrontab, line_num);
-    }
+    jr->named_period = named_period;
     jr->period = 0;
     delay += random_number;
     jr->delay = delay;
@@ -274,6 +279,12 @@ unbiased_rand(long int max)
     long int rn;
     long int divisor;
 
+    /* No delay was asked for.  RAND_MAX / (max + 1) is zero for any max at or
+     * above RAND_MAX, which makes the division below a SIGFPE; a negative
+     * divisor (max overflowed by the + 1) makes the loop endless. */
+    if (max <= 0) return 0;
+    if (max >= RAND_MAX) return random();
+
     divisor = RAND_MAX / (max + 1);
 
     do {
@@ -296,6 +307,7 @@ parse_tab_line(char *line)
     char *from;
     char *to;
     char *pref_hour;
+    int random_delay;
 
     /* an empty line? */
     r = match_rx("^[ \t]*($|#)", line, 0);
@@ -312,28 +324,37 @@ parse_tab_line(char *line)
     if (r == -1) goto reg_err;
     if (r)
     {
-        if (strncmp(env_var, "START_HOURS_RANGE", 17) == 0)
+        if (strcmp(env_var, "START_HOURS_RANGE") == 0)
         {
             r = match_rx("^([[:digit:]]+)-([[:digit:]]+)$", value, 2, &from, &to);
             if (r == -1) goto reg_err;
             if (r == 0) goto reg_invalid;
-            range_start = atoi(from);
-            range_stop = atoi(to);
-            if (range_stop < range_start) {
+            range_start = conv2int(from);
+            range_stop = conv2int(to);
+            if (range_start < 0 || range_start > 24 ||
+                    range_stop < 0 || range_stop > 24 ||
+                    range_stop < range_start) {
                 range_start = 0; range_stop = 0;
                 goto reg_invalid;
             }
             Debug(("Jobs will start in the %02d:00-%02d:00 range.", range_start, range_stop));
         }
-        else if (strncmp(env_var, "RANDOM_DELAY", 12) == 0) {
+        else if (strcmp(env_var, "RANDOM_DELAY") == 0) {
             r = match_rx("^([[:digit:]]+)$", value, 0);
             if (r == -1) goto reg_err;
             if (r == 0) goto reg_invalid;
 
-            random_number = (int)unbiased_rand(atoi(value));
+            random_delay = conv2int(value);
+            if (random_delay < 0) {
+                complain("%s: number out of range on line %d, skipping",
+                         anacrontab, line_num);
+                return;
+            }
+
+            random_number = (int)unbiased_rand(random_delay);
             Debug(("Randomized delay set: %d", random_number));
         }
-        else if (strncmp(env_var, "PREFERRED_HOUR", 14) == 0) {
+        else if (strcmp(env_var, "PREFERRED_HOUR") == 0) {
             r = match_rx("^([[:digit:]]+)$", value, 1, &pref_hour);
             if (r == -1) goto reg_err;
 

@@ -29,6 +29,8 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <pwd.h>
+#include <errno.h>
+#include <inttypes.h>
 
 #include "globals.h"
 #include "funcs.h"
@@ -96,11 +98,53 @@ void printflags(char *indent, int flags) {
 }
 
 /*
+ * print a string as a YAML double-quoted scalar
+ */
+static void print_yaml_string(const char *value) {
+	const unsigned char *p = (const unsigned char *) value;
+
+	putchar('"');
+	for (; *p != '\0'; p++) {
+		switch (*p) {
+		case '"':
+			fputs("\\\"", stdout);
+			break;
+		case '\\':
+			fputs("\\\\", stdout);
+			break;
+		case '\b':
+			fputs("\\b", stdout);
+			break;
+		case '\f':
+			fputs("\\f", stdout);
+			break;
+		case '\n':
+			fputs("\\n", stdout);
+			break;
+		case '\r':
+			fputs("\\r", stdout);
+			break;
+		case '\t':
+			fputs("\\t", stdout);
+			break;
+		default:
+			if (*p < 0x20 || *p == 0x7f)
+				printf("\\x%02X", *p);
+			else
+				putchar(*p);
+		}
+	}
+	putchar('"');
+}
+
+/*
  * print a crontab entry
  */
 void printentry(char *indent, entry *e, time_t next) {
 	printf("%s  - user: %s\n", indent, e->pwd->pw_name);
-	printf("%s    cmd: \"%s\"\n", indent, e->cmd);
+	printf("%s    cmd: ", indent);
+	print_yaml_string(e->cmd);
+	printf("\n");
 	printf("%s    flags: 0x%02X\n", indent, e->flags);
 	printflags(indent, e->flags);
 	printf("%s    delay: %d\n", indent, e->delay);
@@ -131,19 +175,20 @@ void printcrontab(user *u) {
  */
 
 /*
- * check whether time matches day of month and/or day of week; this requires
- * checking dom if dow=*, dow if dom=*, either one otherwise; see comment "the
- * dom/dow situation is odd..." in cron.c
+ * check whether time matches day of month and/or day of week; when either
+ * field uses '*' syntax both bitmaps must match, otherwise either bitmap may
+ * match. This mirrors the dom/dow logic in cron.c. The bitmap still matters
+ * for stepped forms using a star with a step value, even though the corresponding STAR flag is
+ * set.
  */
 int matchday(entry *e, time_t time) {
 	struct tm current;
 
 	localtime_r(&time, &current);
 
-	if (e->flags & DOW_STAR)
-		return bit_test(e->dom, current.tm_mday - 1);
-	if (e->flags & DOM_STAR) 
-		return bit_test(e->dow, current.tm_wday);
+	if (e->flags & (DOM_STAR | DOW_STAR))
+		return bit_test(e->dom, current.tm_mday - 1) &&
+			bit_test(e->dow, current.tm_wday);
 	return bit_test(e->dom, current.tm_mday - 1) ||
 		bit_test(e->dow, current.tm_wday);
 }
@@ -173,10 +218,33 @@ time_t nextmatch(entry *e, time_t start, time_t end) {
 			continue;
 		}
 
-		/* neither time nor time+1day match day: increase 1 day */
-		if (!matchday(e, time) && !matchday(e, time + 24 * 60 * 60)) {
-			time += 24 * 60 * 60;
-			continue;
+		/* neither the current nor the next calendar day match: skip ahead */
+		{
+			struct tm nextday = current;
+			time_t tomorrow;
+
+			/*
+			 * Anchor at local noon before adding 24 hours.  Across a DST
+			 * transition this stays within the following calendar day, unlike
+			 * adding 24 hours to a late-evening timestamp.
+			 */
+			nextday.tm_hour = 12;
+			nextday.tm_min = 0;
+			nextday.tm_sec = 0;
+			nextday.tm_isdst = -1;
+			tomorrow = mktime(&nextday) + 24 * 60 * 60;
+			localtime_r(&tomorrow, &nextday);
+
+			nextday.tm_hour = 0;
+			nextday.tm_min = 0;
+			nextday.tm_sec = 0;
+			nextday.tm_isdst = -1;
+			tomorrow = mktime(&nextday);
+
+			if (!matchday(e, time) && !matchday(e, tomorrow)) {
+				time = tomorrow;
+				continue;
+			}
 		}
 
 		/* if time matches, return time;
@@ -327,6 +395,28 @@ void usage() {
 }
 
 /*
+ * Parse a time argument, in seconds since the Epoch, for option opt.
+ * The value is a time_t: reading it with atoi() into an int truncated every
+ * time from 2038-01-19 on, and overflowed in the + 59 rounding just below
+ * INT_MAX.  Exits on a malformed or unrepresentable value instead of
+ * silently answering for a different time.
+ */
+static time_t parse_time_arg(const char *opt, const char *arg) {
+	char *endptr;
+	intmax_t val;
+
+	errno = 0;
+	val = strtoimax(arg, &endptr, 10);
+	if (errno != 0 || endptr == arg || *endptr != '\0' ||
+	    (intmax_t)(time_t) val != val || val > INTMAX_MAX - 60) {
+		fprintf(stderr, "invalid time for %s: %s\n", opt, arg);
+		usage();
+		exit(EXIT_FAILURE);
+	}
+	return (time_t) val;
+}
+
+/*
  * main
  */
 int main(int argn, char *argv[]) {
@@ -361,10 +451,10 @@ int main(int argn, char *argv[]) {
 			flags &= ~SYSTEM;
 			break;
 		case 't':
-			start = (atoi(optarg) + 59) / 60 * 60;
+			start = (parse_time_arg("-t", optarg) + 59) / 60 * 60;
 			break;
 		case 'q':
-			end = atoi(optarg) / 60 * 60;
+			end = parse_time_arg("-q", optarg) / 60 * 60;
 			endtime = 1;
 			break;
 		case 'j':

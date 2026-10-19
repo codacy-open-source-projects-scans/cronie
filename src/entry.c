@@ -200,6 +200,7 @@ entry *load_entry(FILE * file, void (*error_func) (const char *), struct passwd 
 			bit_nset(e->dom, 0, LAST_DOM - FIRST_DOM);
 			bit_nset(e->month, 0, LAST_MONTH - FIRST_MONTH);
 			bit_nset(e->dow, 0, LAST_DOW - FIRST_DOW);
+			e->flags |= DOM_STAR | DOW_STAR;
 		}
 		else if (!strcmp("hourly", cmd)) {
 			bit_set(e->minute, 0);
@@ -207,7 +208,7 @@ entry *load_entry(FILE * file, void (*error_func) (const char *), struct passwd 
 			bit_nset(e->dom, 0, LAST_DOM - FIRST_DOM);
 			bit_nset(e->month, 0, LAST_MONTH - FIRST_MONTH);
 			bit_nset(e->dow, 0, LAST_DOW - FIRST_DOW);
-			e->flags |= HR_STAR;
+			e->flags |= HR_STAR | DOM_STAR | DOW_STAR;
 		}
 		else {
 			ecode = e_timespec;
@@ -634,12 +635,15 @@ get_range(bitstr_t * bits, int low, int high, const char *names[],
 				return (EOF);
 
 			case R_RANGE_NUM2:
+				if (low_ > high_ && high_ == 0 && high == LAST_DOW) {
+					high_ = 7;
+				}
+				if (low_ > high_) {
+					return (EOF);
+				}
 				if (ch == '/') {
 					state = R_STEP;
 					break;
-				}
-				if (low_ > high_ && high_ == 0) {
-					high_ = 7;
 				}
 				if (is_separator(ch)) {
 					state = R_FINISH;
@@ -678,6 +682,13 @@ get_range(bitstr_t * bits, int low, int high, const char *names[],
 		}
 	}
 	if (state != R_FINISH || ch == EOF)
+		return (EOF);
+
+	/* The upper end of a range is otherwise only used as a loop bound.
+	 * Validate it explicitly so an oversized endpoint cannot be skipped by
+	 * a large step and silently accepted (for example 1-234/5678).
+	 */
+	if (high_ < low || high_ > high)
 		return (EOF);
 
 	/* Make sure the step size makes any sense */
